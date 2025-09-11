@@ -9,8 +9,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"
 	"sync"
+	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	modbus "github.com/goburrow/modbus"
@@ -46,18 +46,19 @@ var (
 	gridDraw                int
 	gridFeed                int
 	pauseActivated          bool
+	postCommandDelayMs      int // Delay after write before readback
 
 	// Synchronization primitives to prevent Modbus command interference
-	modbusMu                sync.Mutex
-	controlMu               sync.Mutex
+	modbusMu  sync.Mutex
+	controlMu sync.Mutex
 
 	// Cached topic prefixes
-	sensorTopicPrefix       string
-	selectStateTopicPrefix  string
-	numberStateTopicPrefix  string
+	sensorTopicPrefix      string
+	selectStateTopicPrefix string
+	numberStateTopicPrefix string
 
 	// Cache of last published sensor values to avoid redundant publishes
-	lastSensorValues        map[string]string
+	lastSensorValues map[string]string
 )
 
 func main() {
@@ -84,7 +85,11 @@ func main() {
 
 	// Listen for MQTT messages
 	listenTopic := fmt.Sprintf("homeassistant/+/%s/+/set", deviceID)
-	mqttClient.Subscribe(listenTopic, 0, mqttMessageHandler)
+	token := mqttClient.Subscribe(listenTopic, 0, mqttMessageHandler)
+	token.Wait()
+	if debugEnabled {
+		log.Printf("Subscribed to: %s", listenTopic)
+	}
 
 	// Keep the application running
 	select {}
@@ -112,6 +117,12 @@ func loadConfig() {
 	resetIntervalMinutes, err = strconv.Atoi(getEnv("RESET_INTERVAL_MINUTES", "5"))
 	if err != nil || resetIntervalMinutes <= 0 {
 		resetIntervalMinutes = 5
+	}
+
+	// Post-command stabilization delay (ms)
+	postCommandDelayMs, err = strconv.Atoi(getEnv("POST_COMMAND_DELAY_MS", "1600"))
+	if err != nil || postCommandDelayMs < 0 {
+		postCommandDelayMs = 1600
 	}
 
 	deviceID = getEnv("DEVICE_ID", "sma_battery_controller")
@@ -178,24 +189,22 @@ func publishDiscoveryMessages() {
 		"name":         "SMA Battery Controller",
 	}
 
-	// Publish entities only if defaults are still in use
-	if automaticLogicSelection == "Automatic" {
-		publishSelect("automatic_logic_selection", "Automatic Logic Selection", []string{"Automatic", "Pause (charge ok)", "Pause", "Charge Battery", "Discharge Battery"}, automaticLogicSelection, deviceInfo)
-	}
-
-	if overwriteLogicSelection == "Automatic" {
-		publishSelect("overwrite_logic_selection", "Overwrite Logic Selection", []string{"Off", "Automatic", "Pause (charge ok)", "Pause", "Charge Battery", "Discharge Battery"}, overwriteLogicSelection, deviceInfo)
-	}
-
-	publishSelect("current_logic_selection", "Current Logic Selection", []string{"Automatic", "Pause (charge ok)", "Pause", "Charge Battery", "Discharge Battery"}, currentLogicSelection, deviceInfo)
+	// Always publish discovery for selects and number so HA can send commands
+	publishSelect("automatic_logic_selection", "Automatic Logic Selection", []string{"Automatic", "Balanced", "Pause (charge ok)", "Pause", "Charge Battery", "Discharge Battery"}, automaticLogicSelection, deviceInfo)
+	publishSelect("overwrite_logic_selection", "Overwrite Logic Selection", []string{"Off", "Automatic", "Balanced", "Pause (charge ok)", "Pause", "Charge Battery", "Discharge Battery"}, overwriteLogicSelection, deviceInfo)
+	// Make Current Logic Selection read-only by publishing as a sensor (no command topic)
+	publishSensor("current_logic_selection", "Current Logic Selection", "", deviceInfo)
+	// Remove old select-based Current Logic Selection entity by clearing its discovery and state
+	oldSelectConfigTopic := fmt.Sprintf("homeassistant/select/%s/current_logic_selection/config", deviceID)
+	mqttPublish(oldSelectConfigTopic, []byte(""), true)
+	oldSelectStateTopic := fmt.Sprintf("homeassistant/select/%s/current_logic_selection/state", deviceID)
+	mqttPublish(oldSelectStateTopic, []byte(""), true)
 
 	if batteryControl == 0 {
 		batteryControl = int(math.Round(float64(maximumBatteryControl) * 0.90)) // 90% of max control
 		lastValidBatteryControl = batteryControl
-		publishNumber("battery_control", "Battery Control", 0, float64(maximumBatteryControl), 100, float64(batteryControl), deviceInfo)
-	} else {
-		publishNumber("battery_control", "Battery Control", 0, float64(maximumBatteryControl), 100, float64(batteryControl), deviceInfo)
 	}
+	publishNumber("battery_control", "Battery Control", 0, float64(maximumBatteryControl), 100, float64(batteryControl), deviceInfo)
 
 	// Publish sensors regardless of initial state
 	publishSensor("battery_status", "Battery Status", "", deviceInfo)
@@ -348,24 +357,40 @@ var polledRegisters = []regDef{
 }
 
 func modbusReadLoop() {
-	ticker := time.NewTicker(time.Duration(modbusIntervalInSeconds) * time.Second)
-	resetTicker := time.NewTicker(time.Duration(resetIntervalMinutes) * time.Minute) // Check every minute
+	// Normal polling ticker and a fast 1s ticker used while in Balanced mode
+	normalTicker := time.NewTicker(time.Duration(modbusIntervalInSeconds) * time.Second)
+	fastTicker := time.NewTicker(1 * time.Second)
+	resetTicker := time.NewTicker(time.Duration(resetIntervalMinutes) * time.Minute) // periodic control logic check
+	fullPublishTicker := time.NewTicker(30 * time.Minute)                            // force full sensor publish every 30 minutes
 	for {
 		select {
-		case <-ticker.C:
-			readAndPublishData()
-			checkPauseChargeOkMode()
+		case <-fastTicker.C:
+			// When Balanced overwrite is active, poll every second for quick reactions
+			if overwriteLogicSelection == "Balanced" {
+				readAndPublishData()
+				checkPauseChargeOkMode()
+			}
+		case <-normalTicker.C:
+			// In non-Balanced modes, poll at the configured interval
+			if overwriteLogicSelection != "Balanced" {
+				readAndPublishData()
+				checkPauseChargeOkMode()
+			}
 		case <-resetTicker.C:
 			applyControlLogic()
+		case <-fullPublishTicker.C:
+			// Clear cache to force publish of all sensors, then read and publish immediately
+			lastSensorValues = make(map[string]string, len(polledRegisters)+1)
+			readAndPublishData()
 		}
 	}
 }
 
 func readAndPublishData() {
 	for _, r := range polledRegisters {
- 	modbusMu.Lock()
- 	result, err := modbusClient.ReadInputRegisters(r.addr, 2)
- 	modbusMu.Unlock()
+		modbusMu.Lock()
+		result, err := modbusClient.ReadInputRegisters(r.addr, 2)
+		modbusMu.Unlock()
 		if err != nil {
 			if debugEnabled {
 				log.Printf("Error reading %s register: %v", r.name, err)
@@ -438,6 +463,11 @@ func checkPauseChargeOkMode() {
 	} else {
 		currentMode = automaticLogicSelection
 	}
+	// Continuously react in Balanced only when Overwrite is actively set to Balanced (not in Automatic mode)
+	if overwriteLogicSelection == "Balanced" {
+		applyControlLogic()
+		return
+	}
 	if currentMode == "Pause (charge ok)" && !pauseActivated && batteryDischargePower > 0 {
 		applyControlLogic()
 	}
@@ -458,7 +488,8 @@ func applyControlLogic() {
 
 	if currentMode != currentLogicSelection {
 		currentLogicSelection = currentMode
-		stateTopic := fmt.Sprintf("homeassistant/select/%s/current_logic_selection/state", deviceID)
+		// Publish current logic selection as a read-only sensor state
+		stateTopic := fmt.Sprintf("homeassistant/sensor/%s/current_logic_selection/state", deviceID)
 		mqttPublish(stateTopic, []byte(currentLogicSelection), true)
 	}
 
@@ -478,7 +509,13 @@ func applyControlLogic() {
 	if spntCom != 0 {
 		// Write control commands to Modbus
 		writeControlCommands(spntCom, pwrAtCom)
+		// Give inverter a brief moment to apply new settings before reading back
+		// In Balanced mode we must react quickly based on grid values: skip the post_command delay
+		if currentMode != "Balanced" {
+			time.Sleep(time.Duration(postCommandDelayMs) * time.Millisecond)
+		}
 	}
+	// Always read and publish after evaluating/applying control changes
 	readAndPublishData()
 }
 
@@ -519,6 +556,78 @@ func applyMode(mode string, spntCom *uint32, pwrAtCom *int32) {
 		pauseActivated = false
 		*spntCom = controlOn
 		*pwrAtCom = int32(batteryControl)
+	case "Balanced":
+		// Only send Balanced commands when Overwrite is actively set to Balanced; otherwise do nothing (no writes)
+		if overwriteLogicSelection != "Balanced" {
+			*spntCom = 0
+			*pwrAtCom = 0
+			if debugEnabled {
+				log.Println("Balanced logic ignored because we are in Automatic mode")
+			}
+			break
+		}
+		// If battery_control is 0 (either just became 0 or stayed 0), treat as internal Automatic: do not send Modbus commands
+		if batteryControl == 0 {
+			*spntCom = 0
+			*pwrAtCom = 0
+			if debugEnabled {
+				log.Println("Balanced: battery_control is 0 → internal Automatic, no Modbus commands")
+			}
+			break
+		}
+		// Balanced logic (discharge-only commands) with dynamic battery_control adjustment:
+		// - If grid_draw == 0 and battery_discharge_power == 0: set battery_control to 0 and do not write (internal Automatic)
+		// - If grid_draw > 0: increase battery_control by grid_draw (clamped) and discharge with that value
+		// - If grid_draw == 0 and grid_feed > 0: decrease battery_control by grid_feed; if <=0 set to 0 and do not write
+		if gridDraw == 0 && batteryDischargePower == 0 {
+			if batteryControl != 0 {
+				batteryControl = 0
+				lastValidBatteryControl = 0
+				stateTopic := fmt.Sprintf("homeassistant/number/%s/%s/state", deviceID, "battery_control")
+				mqttPublish(stateTopic, []byte("0"), true)
+			}
+			*spntCom = 0
+			*pwrAtCom = 0
+		} else if gridDraw > 0 {
+			newBC := batteryControl + gridDraw
+			if newBC > maximumBatteryControl {
+				newBC = maximumBatteryControl
+			}
+			if newBC != batteryControl {
+				batteryControl = newBC
+				lastValidBatteryControl = newBC
+				stateTopic := fmt.Sprintf("homeassistant/number/%s/%s/state", deviceID, "battery_control")
+				mqttPublish(stateTopic, []byte(strconv.Itoa(newBC)), true)
+			}
+			*spntCom = controlOn
+			*pwrAtCom = int32(newBC)
+		} else if gridFeed > 0 { // gridDraw == 0 implied here
+			newBC := batteryControl - gridFeed
+			if newBC > 0 {
+				if newBC != batteryControl {
+					batteryControl = newBC
+					lastValidBatteryControl = newBC
+					stateTopic := fmt.Sprintf("homeassistant/number/%s/%s/state", deviceID, "battery_control")
+					mqttPublish(stateTopic, []byte(strconv.Itoa(newBC)), true)
+				}
+				*spntCom = controlOn
+				*pwrAtCom = int32(newBC)
+			} else {
+				// Going to zero or below: set to 0 and do not write (internal Automatic)
+				if batteryControl != 0 {
+					batteryControl = 0
+					lastValidBatteryControl = 0
+					stateTopic := fmt.Sprintf("homeassistant/number/%s/%s/state", deviceID, "battery_control")
+					mqttPublish(stateTopic, []byte("0"), true)
+				}
+				*spntCom = 0
+				*pwrAtCom = 0
+			}
+		} else {
+			// Fallback: no decisive grid change detected, do not write
+			*spntCom = 0
+			*pwrAtCom = 0
+		}
 	default: // Automatic
 		pauseActivated = false
 		*spntCom = controlOff
@@ -650,12 +759,6 @@ func mqttMessageHandler(client mqtt.Client, msg mqtt.Message) {
 			applyControlLogic()
 			lastChangeTime = time.Now()
 		} else if objectID == "overwrite_logic_selection" {
-			overwriteLogicSelection = payload
-			stateTopic := fmt.Sprintf("homeassistant/select/%s/%s/state", deviceID, objectID)
-			mqttPublish(stateTopic, []byte(payload), true)
-			applyControlLogic()
-			lastChangeTime = time.Now()
-		} else if objectID == "current_logic_selection" {
 			overwriteLogicSelection = payload
 			stateTopic := fmt.Sprintf("homeassistant/select/%s/%s/state", deviceID, objectID)
 			mqttPublish(stateTopic, []byte(payload), true)
