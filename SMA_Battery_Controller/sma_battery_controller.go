@@ -10,10 +10,17 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"sync"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	modbus "github.com/goburrow/modbus"
 )
+
+// regDef describes a Modbus input register we poll and expose
+type regDef struct {
+	name string
+	addr uint16
+}
 
 var (
 	mqttClient              mqtt.Client
@@ -39,6 +46,18 @@ var (
 	gridDraw                int
 	gridFeed                int
 	pauseActivated          bool
+
+	// Synchronization primitives to prevent Modbus command interference
+	modbusMu                sync.Mutex
+	controlMu               sync.Mutex
+
+	// Cached topic prefixes
+	sensorTopicPrefix       string
+	selectStateTopicPrefix  string
+	numberStateTopicPrefix  string
+
+	// Cache of last published sensor values to avoid redundant publishes
+	lastSensorValues        map[string]string
 )
 
 func main() {
@@ -104,6 +123,12 @@ func loadConfig() {
 	lastValidBatteryControl = 0
 	previousMode = ""
 	lastChangeTime = time.Now()
+
+	// Precompute topic prefixes and initialize caches
+	sensorTopicPrefix = "homeassistant/sensor/" + deviceID + "/"
+	selectStateTopicPrefix = "homeassistant/select/" + deviceID + "/"
+	numberStateTopicPrefix = "homeassistant/number/" + deviceID + "/"
+	lastSensorValues = make(map[string]string, 24)
 }
 
 func setupMQTT() {
@@ -287,16 +312,39 @@ func setupModbus() {
 	handler.SlaveId = 3 // SMA inverter Modbus slave ID
 
 	// Connect to Modbus device
+	modbusMu.Lock()
 	err := handler.Connect()
 	if err != nil {
+		modbusMu.Unlock()
 		log.Fatalf("Modbus connection error: %v", err)
 	}
 	modbusClient = modbus.NewClient(handler)
+	modbusMu.Unlock()
 	currentTime := time.Now()
 	timeDiff := currentTime.Sub(modbusClientErrorTime)
 	if timeDiff > 30*time.Minute {
 		modbusClientErrorCount = 0
 	}
+}
+
+// Static list of polled input registers (2 words each)
+var polledRegisters = []regDef{
+	{"battery_status", 31391},
+	{"battery_soc", 30845},
+	{"battery_temperature", 30849},
+	{"battery_diagnose_current_capacity", 30847},
+	{"battery_charge_power", 31393},
+	{"battery_discharge_power", 31395},
+	{"dc1_current", 30769},
+	{"dc1_voltage", 30771},
+	{"dc1_power", 30773},
+	{"dc2_current", 30957},
+	{"dc2_voltage", 30959},
+	{"dc2_power", 30961},
+	{"ac_power", 30775},
+	{"grid_feed", 30867},
+	{"grid_draw", 30865},
+	{"inverter_temperature", 30953},
 }
 
 func modbusReadLoop() {
@@ -314,31 +362,13 @@ func modbusReadLoop() {
 }
 
 func readAndPublishData() {
-	// Define Modbus input register addresses
-	registers := map[string]uint16{
-		"battery_status":                    31391,
-		"battery_soc":                       30845,
-		"battery_temperature":               30849,
-		"battery_diagnose_current_capacity": 30847,
-		"battery_charge_power":              31393,
-		"battery_discharge_power":           31395,
-		"dc1_current":                       30769,
-		"dc1_voltage":                       30771,
-		"dc1_power":                         30773,
-		"dc2_current":                       30957,
-		"dc2_voltage":                       30959,
-		"dc2_power":                         30961,
-		"ac_power":                          30775,
-		"grid_feed":                         30867,
-		"grid_draw":                         30865,
-		"inverter_temperature":              30953,
-	}
-
-	for key, address := range registers {
-		result, err := modbusClient.ReadInputRegisters(address, 2)
+	for _, r := range polledRegisters {
+ 	modbusMu.Lock()
+ 	result, err := modbusClient.ReadInputRegisters(r.addr, 2)
+ 	modbusMu.Unlock()
 		if err != nil {
 			if debugEnabled {
-				log.Printf("Error reading %s register: %v", key, err)
+				log.Printf("Error reading %s register: %v", r.name, err)
 			}
 			modbusClientErrorCount++
 			modbusClientErrorTime = time.Now()
@@ -355,55 +385,50 @@ func readAndPublishData() {
 		value := int32(binary.BigEndian.Uint32(result))
 		valueFloat := float32(value)
 
-		// Update control variables
-		switch key {
-		case "dc1_current":
-			valueFloat = valueFloat * .001
-			break
-		case "dc2_current":
-			valueFloat = valueFloat * .001
-			break
-		case "dc1_voltage":
-			valueFloat = valueFloat * .01
-			break
-		case "dc2_voltage":
-			valueFloat = valueFloat * .01
-			break
+		// Update control variables and apply scaling
+		switch r.name {
+		case "dc1_current", "dc2_current":
+			valueFloat = valueFloat * 0.001
+		case "dc1_voltage", "dc2_voltage":
+			valueFloat = valueFloat * 0.01
 		case "battery_temperature":
-			valueFloat = valueFloat * .1
-			break
+			valueFloat = valueFloat * 0.1
 		case "inverter_temperature":
-			valueFloat = valueFloat * .01
-			break
+			valueFloat = valueFloat * 0.01
 		case "battery_discharge_power":
 			batteryDischargePower = int(value)
-			break
 		case "battery_charge_power":
 			batteryChargePower = int(value)
-			break
 		case "ac_power":
 			acPower = int(value)
-			break
 		case "grid_feed":
 			gridFeed = int(value)
-			break
 		case "grid_draw":
 			gridDraw = int(value)
-			break
 		}
 
-		// Publish to MQTT
-		stateTopic := fmt.Sprintf("homeassistant/sensor/%s/%s/state", deviceID, key)
+		// Build payload string efficiently and publish only if changed
+		var payloadStr string
 		if int32(valueFloat) != value {
-			mqttPublish(stateTopic, []byte(fmt.Sprintf("%f", valueFloat)), false)
+			// format float with trimming to avoid noisy changes
+			payloadStr = strconv.FormatFloat(float64(valueFloat), 'f', 2, 64)
 		} else {
-			mqttPublish(stateTopic, []byte(fmt.Sprintf("%d", value)), false)
+			payloadStr = strconv.FormatInt(int64(value), 10)
+		}
+		stateTopic := sensorTopicPrefix + r.name + "/state"
+		if last, ok := lastSensorValues[r.name]; !ok || last != payloadStr {
+			lastSensorValues[r.name] = payloadStr
+			mqttPublish(stateTopic, []byte(payloadStr), false)
 		}
 	}
 
-	// Publish to MQTT
-	stateTopic := fmt.Sprintf("homeassistant/sensor/%s/%s/state", deviceID, "modbus_error_count")
-	mqttPublish(stateTopic, []byte(fmt.Sprintf("%d", modbusClientErrorCount)), false)
+	// Publish modbus error count
+	stateTopic := sensorTopicPrefix + "modbus_error_count/state"
+	payload := strconv.FormatInt(int64(modbusClientErrorCount), 10)
+	if last, ok := lastSensorValues["modbus_error_count"]; !ok || last != payload {
+		lastSensorValues["modbus_error_count"] = payload
+		mqttPublish(stateTopic, []byte(payload), false)
+	}
 }
 
 func checkPauseChargeOkMode() {
@@ -419,6 +444,8 @@ func checkPauseChargeOkMode() {
 }
 
 func applyControlLogic() {
+	controlMu.Lock()
+	defer controlMu.Unlock()
 	var spntCom uint32 = 0
 	var pwrAtCom int32 = 0
 	var currentMode string
@@ -500,6 +527,8 @@ func applyMode(mode string, spntCom *uint32, pwrAtCom *int32) {
 }
 
 func writeControlCommands(spntCom uint32, pwrAtCom int32) {
+	modbusMu.Lock()
+	defer modbusMu.Unlock()
 	// Write to register 40151 (Communication control)
 	spntComData := uint32ToBytes(spntCom)
 	if debugEnabled {
@@ -657,7 +686,13 @@ func mqttMessageHandler(client mqtt.Client, msg mqtt.Message) {
 
 func mqttPublish(topic string, payload []byte, retain bool) {
 	token := mqttClient.Publish(topic, 0, retain, payload)
-	token.Wait()
+	// For retained/config messages we wait; for high-frequency telemetry we don't block
+	if retain || debugEnabled {
+		token.Wait()
+	} else {
+		// non-blocking publish; let the client handle delivery
+		go func() { _ = token.Wait() }()
+	}
 	if debugEnabled {
 		log.Printf("Published MQTT message to %s: %s", topic, payload)
 	}

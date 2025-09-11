@@ -1,6 +1,17 @@
 # Changelog
 **Warning:** This is not an official add-on and is not affiliated with SMA. Use at your own risk. This software is experimental.
 
+## 0.0.10
+- Ensure Modbus commands are sent immediately on MQTT commands by serializing Modbus access with a mutex.
+- Prevent interference between reads and writes and between concurrent commands by locking around Modbus IO and command application.
+
+## 0.0.9
+- Performance optimizations:
+  - Avoid redundant MQTT publishes by caching last sensor values.
+  - Reduced allocations by caching MQTT topic prefixes and using efficient number formatting.
+  - Replaced per-iteration map with static register list in Modbus read loop.
+  - Non-blocking MQTT publishes for high-frequency telemetry (retain=false).
+
 ## 0.0.8
 - trying to optimize reconnect
 
