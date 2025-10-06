@@ -1,2 +1,2 @@
 #!/bin/bash
-docker build -t tweyand/comfoair2mqtt .
+docker build -t bizziebis/comfoair2mqtt .
