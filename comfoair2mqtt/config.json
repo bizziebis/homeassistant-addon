@@ -61,5 +61,5 @@
     "HAAutoDiscoveryDeviceManufacturer": "str?",
     "HAAutoDiscoveryDeviceModel": "str?"
   },
-  "image": "bizziebis/comfoair2mqtt-{arch}"
+  "image": "tweyand/comfoair2mqtt-{arch}"
 }
