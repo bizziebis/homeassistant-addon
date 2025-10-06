@@ -98,7 +98,7 @@ bashio::log.info "Startup hacomfoairmqtt"
 # Start the first process
 if [ "$SOCAT_ENABLED" == "True" ]; then
     echo "create serial device over ethernet with socat for ip $(bashio::services 'socat' 'host'):$(bashio::services 'socat' 'port')"
-    /usr/bin/socat -d -d pty,link="$(bashio::config 'serial')",raw,group-late=dialout,mode=660 tcp:"$(bashio::services 'socat' 'host')":"$(bashio::services 'socat' 'port')" &
+    /usr/bin/socat -d -d pty,link="$(bashio::config 'serial')",raw,group-late=dialout,mode=660 tcp:"$(bashio::config 'SOCAT_host')":"$(bashio::config 'SOCAT_port')" &
     export SERIAL_DEVICE=/dev/comfoair
 else
     echo "don't create serial device over ehternet. enable it with SOCAT=True"
